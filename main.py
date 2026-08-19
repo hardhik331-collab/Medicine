@@ -24,14 +24,14 @@ app.add_middleware(
 
 
 @app.get("/live-price")
-def live_price(brand: str):
+def live_price(brand: str, pincode: str = ""):
     """
     Called when the user expands a medicine card on the frontend.
     Returns {"1mg": {...} | null, "pharmeasy": ..., "apollo": ..., "netmeds": ...}
     Any platform that fails (blocked, changed layout, timeout) comes back null —
     the frontend falls back to a plain deep-link for that one.
     """
-    return search_all_sources(brand)
+    return search_all_sources(brand, pincode)
 
 
 @app.get("/health")

@@ -1,15 +1,20 @@
 """
 LIVE PRICE SCRAPERS — Apollo Pharmacy / Netmeds / Tata 1mg / PharmEasy
 
-READ THIS FIRST:
+STATUS (Aug 2026):
+- Apollo Pharmacy: VERIFIED, working. GET search.apollo247.com/v4/search
+- Netmeds: VERIFIED, working. GET netmeds.com/ext/search/application/api/v1.0/products
+- Tata 1mg: PLACEHOLDER — not yet verified.
+- PharmEasy: PLACEHOLDER — not yet verified.
+
+For the two PLACEHOLDER platforms below:
 1. None of these sites offer a public pricing API. Prices load via internal
    JSON endpoints their own frontend JS calls (React/Next apps) — plain
    requests.get() on the page HTML usually will NOT contain the price.
 2. To get the REAL endpoint: open the site in Chrome -> DevTools -> Network
    tab -> filter "Fetch/XHR" -> search a medicine -> find the request that
    returns JSON with price/product data -> copy its URL pattern + response
-   shape here. This sandbox has no network access to these domains, so
-   everything below is a best-guess starting point, not verified.
+   shape here.
 3. CAPTCHA / "Access Denied" / Cloudflare challenge = bot detection fired.
    There's no reliable way around this respectfully. If it happens
    consistently, fall back to deep-linking (already in the frontend) instead
@@ -39,37 +44,61 @@ def _safe_get(url, **kw):
         return None
 
 
-def search_apollo(brand_name: str):
+def search_apollo(brand_name: str, pincode: str = ""):
     """
-    PLACEHOLDER endpoint — verify via DevTools on apollopharmacy.in.
-    Expected shape once fixed: JSON list with a price field per product.
+    VERIFIED via live DevTools capture (Aug 2026).
+    Endpoint: GET https://search.apollo247.com/v4/search
+    Plain GET, no auth required. pincode is optional but improves accuracy
+    (affects stock/delivery, not price, in most cases).
     """
     resp = _safe_get(
-        "https://www.apollopharmacy.in/api/v1/search",
-        params={"q": brand_name},
+        "https://search.apollo247.com/v4/search",
+        params={"query": brand_name, "pincode": pincode},
     )
     if not resp:
         return None
     try:
         data = resp.json()
-        item = data["products"][0]
-        return {"price": item.get("price") or item.get("mrp"), "in_stock": item.get("in_stock", True)}
+        products = data["data"]["productDetails"]["products"]
+        if not products:
+            return None
+        item = products[0]
+        return {
+            "price": item.get("specialPrice") or item.get("price"),
+            "mrp": item.get("price"),
+            "in_stock": item.get("inStock", True),
+            "url": f"https://www.apollopharmacy.in/otc/{item.get('urlKey')}" if item.get("urlKey") else None,
+        }
     except Exception:
         return None
 
 
 def search_netmeds(brand_name: str):
-    """PLACEHOLDER — verify via DevTools on netmeds.com."""
+    """
+    VERIFIED via live DevTools capture (Aug 2026).
+    Endpoint: GET https://www.netmeds.com/ext/search/application/api/v1.0/products
+    Netmeds migrated off Magento to the Fynd commerce platform mid-2026 —
+    the old catalogsearch/result URL is dead. Plain GET, no auth required.
+    """
     resp = _safe_get(
-        "https://www.netmeds.com/rest/V2.4.1/catalogsearch/result",
+        "https://www.netmeds.com/ext/search/application/api/v1.0/products",
         params={"q": brand_name},
     )
     if not resp:
         return None
     try:
         data = resp.json()
-        item = data["products"][0]
-        return {"price": item.get("special_price") or item.get("price"), "in_stock": item.get("is_in_stock", True)}
+        items = data.get("items")
+        if not items:
+            return None
+        item = items[0]
+        price = item.get("price", {})
+        return {
+            "price": price.get("effective", {}).get("min"),
+            "mrp": price.get("marked", {}).get("min"),
+            "in_stock": item.get("sellable", True),
+            "url": f"https://www.netmeds.com/prescriptions/{item.get('slug')}" if item.get("slug") else None,
+        }
     except Exception:
         return None
 
@@ -114,9 +143,9 @@ PLATFORMS = {
 }
 
 
-def search_all_sources(brand_name: str):
+def search_all_sources(brand_name: str, pincode: str = ""):
     """Runs every scraper; each one fails independently and returns None on failure."""
     out = {}
     for key, fn in PLATFORMS.items():
-        out[key] = fn(brand_name)
+        out[key] = fn(brand_name, pincode) if key == "apollo" else fn(brand_name)
     return out
