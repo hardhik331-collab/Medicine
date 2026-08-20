@@ -41,6 +41,10 @@ def search_apollo(brand_name: str, pincode: str = ""):
     resp = _safe_get(
         "https://search.apollo247.com/v4/search",
         params={"query": brand_name, "pincode": pincode},
+        headers={
+            "Referer": "https://www.apollopharmacy.in/",
+            "Origin": "https://www.apollopharmacy.in",
+        },
     )
     if not resp:
         return None
@@ -113,6 +117,7 @@ def search_tata1mg(brand_name: str):
             "X-City": "Gurgaon",  # any valid city works; doesn't affect price
             "X-Access-Key": "1mg_client_access_key",
             "Accept": "application/vnd.healthkartplus.v4+json",
+            "Referer": "https://www.1mg.com/",
         },
     )
     if not resp:
@@ -127,13 +132,18 @@ def search_tata1mg(brand_name: str):
     except Exception:
         return None
 
-    pdp_resp = _safe_get(pdp_url)
+    pdp_resp = _safe_get(pdp_url, headers={"Referer": "https://www.1mg.com/"})
     if not pdp_resp:
         return {"price": None, "mrp": None, "in_stock": True, "url": pdp_url}
     try:
         html = pdp_resp.text
         price_match = re.search(r'displaySmallExtraBold"><span>\u20b9([\d.]+)</span>', html)
         mrp_match = re.search(r'textStrikethrough textTertiary">\u20b9([\d.]+)', html)
+        if not price_match:
+            # Fallback: less brittle pattern in case class names shifted
+            price_match = re.search(r'"mrp"\s*:\s*([\d.]+).*?"discountedPrice"\s*:\s*([\d.]+)', html, re.DOTALL)
+            if price_match:
+                return {"price": float(price_match.group(2)), "mrp": float(price_match.group(1)), "in_stock": True, "url": pdp_url}
         return {
             "price": float(price_match.group(1)) if price_match else None,
             "mrp": float(mrp_match.group(1)) if mrp_match else None,
