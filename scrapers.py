@@ -31,6 +31,30 @@ def _safe_get(url, headers=None, **kw):
         return None
 
 
+def _best_match(candidates, brand_name, name_fn):
+    """
+    Shared brand-matching logic for all four platforms. A search for one
+    brand should never silently return a *different* brand of the same
+    salt (e.g. searching "Azithral 500" should never surface "Aziford
+    500" instead) — pharmacy search APIs frequently do this to push
+    substitutes/cheaper alternatives.
+
+    Returns the first candidate whose name contains every word of the
+    query brand name, or None if nothing matches exactly. None means
+    "don't show a price for this platform" rather than "show a
+    different brand's price" — the frontend already handles None by
+    falling back to a plain deep-link, so nothing breaks.
+    """
+    query_tokens = re.findall(r"[a-z0-9]+", brand_name.lower())
+    if not query_tokens:
+        return None
+    for c in candidates:
+        name_norm = re.sub(r"[^a-z0-9]+", " ", name_fn(c).lower())
+        if all(t in name_norm for t in query_tokens):
+            return c
+    return None
+
+
 def search_apollo(brand_name: str, pincode: str = ""):
     """
     VERIFIED via live DevTools capture (Aug 2026).
@@ -53,7 +77,9 @@ def search_apollo(brand_name: str, pincode: str = ""):
         products = data["data"]["productDetails"]["products"]
         if not products:
             return None
-        item = products[0]
+        item = _best_match(products, brand_name, lambda p: p.get("name", ""))
+        if not item:
+            return None
         url_key = item.get("urlKey")
         prefix = "medicine" if item.get("isPrescriptionRequired") else "otc"
         return {
@@ -84,7 +110,9 @@ def search_netmeds(brand_name: str):
         items = data.get("items")
         if not items:
             return None
-        item = items[0]
+        item = _best_match(items, brand_name, lambda i: i.get("name", ""))
+        if not item:
+            return None
         price = item.get("price", {})
         return {
             "price": price.get("effective", {}).get("min"),
@@ -124,8 +152,12 @@ def search_tata1mg(brand_name: str):
         return None
     try:
         results = resp.json()["data"]["search_results"]
-        drug = next((r for r in results if r.get("type") == "drug"), None)
-        if not drug or not drug.get("url"):
+        drugs = [r for r in results if r.get("type") == "drug" and r.get("url")]
+        # 1mg's autocomplete name field includes <b> highlight tags around
+        # the matched query — strip those before matching so substring
+        # comparison works.
+        drug = _best_match(drugs, brand_name, lambda r: re.sub(r"</?b>", "", r.get("name", "")))
+        if not drug:
             return None
         path = drug["url"].split("?")[0]
         pdp_url = f"https://www.1mg.com{path}"
@@ -180,15 +212,12 @@ def search_pharmeasy(brand_name: str):
         products = next_data["props"]["pageProps"].get("productList")
         if not products:
             return None
-        # PharmEasy's search sometimes leads with a different (often cheaper)
-        # brand of the same salt rather than the brand actually searched.
-        # Prefer a result whose name matches the query brand; fall back to
-        # the first result only if nothing matches.
-        query_tokens = re.findall(r"[a-z0-9]+", brand_name.lower())
-        item = next(
-            (p for p in products if all(t in re.sub(r"[^a-z0-9]+", " ", p.get("name", "").lower()) for t in query_tokens)),
-            products[0],
-        )
+        # PharmEasy's search frequently leads with a different (often
+        # cheaper) brand of the same salt rather than the brand actually
+        # searched — only accept an exact brand-name match.
+        item = _best_match(products, brand_name, lambda p: p.get("name", ""))
+        if not item:
+            return None
         slug = item.get("slug")
         return {
             "price": float(item["salePriceDecimal"]) if item.get("salePriceDecimal") else None,
