@@ -15,7 +15,18 @@ import os
 import re
 import threading
 import time
+from urllib.parse import urlencode
 import requests
+
+# ---------------------------------------------------------------------------
+# Optional Cloudflare Worker fetch proxy
+# ---------------------------------------------------------------------------
+# Apollo blocks Render's datacenter IPs outright. Routing through a
+# Cloudflare Worker gives requests a different source IP that may not be
+# blocked. Set these in Render's Environment tab to enable; leave unset
+# and everything fetches directly exactly as before.
+PROXY_URL = os.environ.get("SCRAPER_PROXY_URL", "")
+PROXY_TOKEN = os.environ.get("SCRAPER_PROXY_TOKEN", "")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -177,9 +188,47 @@ def _llm_extract_price(page_text, brand_name, platform):
 
 
 def _safe_get(url, headers=None, **kw):
+    """
+    Fetch a URL, optionally via the Cloudflare Worker proxy.
+
+    Apollo (and possibly 1mg) block Render's datacenter IPs. If
+    SCRAPER_PROXY_URL is set, requests are routed through a Cloudflare
+    Worker whose edge IPs may not be blocked.
+
+    Falls back to a direct request whenever the proxy is unset, errors,
+    or returns a non-2xx — so enabling the proxy can never make things
+    worse than fetching directly.
+    """
+    merged_headers = {**HEADERS, **(headers or {})}
+    params = kw.pop("params", None)
+
+    # Fold params into the URL ourselves; the proxy takes one encoded `url`.
+    full_url = url
+    if params:
+        query = urlencode({k: v for k, v in params.items() if v not in (None, "")})
+        if query:
+            full_url = f"{url}{'&' if '?' in url else '?'}{query}"
+
+    if PROXY_URL:
+        try:
+            proxy_qs = {"url": full_url}
+            if PROXY_TOKEN:
+                proxy_qs["token"] = PROXY_TOKEN
+            proxy_target = f"{PROXY_URL.rstrip('/')}/?{urlencode(proxy_qs)}"
+
+            # Worker forwards any x-fwd-* header with the prefix stripped.
+            fwd = {f"x-fwd-{k}": v for k, v in merged_headers.items()}
+
+            resp = requests.get(proxy_target, headers=fwd, timeout=TIMEOUT + 4)
+            if resp.status_code == 200:
+                return resp
+            # Non-200 => proxy reachable but upstream refused, or proxy
+            # misconfigured. Fall through to a direct attempt.
+        except Exception:
+            pass
+
     try:
-        merged_headers = {**HEADERS, **(headers or {})}
-        resp = requests.get(url, headers=merged_headers, timeout=TIMEOUT, **kw)
+        resp = requests.get(full_url, headers=merged_headers, timeout=TIMEOUT)
         resp.raise_for_status()
         return resp
     except Exception:
