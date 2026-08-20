@@ -180,7 +180,15 @@ def search_pharmeasy(brand_name: str):
         products = next_data["props"]["pageProps"].get("productList")
         if not products:
             return None
-        item = products[0]
+        # PharmEasy's search sometimes leads with a different (often cheaper)
+        # brand of the same salt rather than the brand actually searched.
+        # Prefer a result whose name matches the query brand; fall back to
+        # the first result only if nothing matches.
+        query_tokens = re.findall(r"[a-z0-9]+", brand_name.lower())
+        item = next(
+            (p for p in products if all(t in re.sub(r"[^a-z0-9]+", " ", p.get("name", "").lower()) for t in query_tokens)),
+            products[0],
+        )
         slug = item.get("slug")
         return {
             "price": float(item["salePriceDecimal"]) if item.get("salePriceDecimal") else None,
