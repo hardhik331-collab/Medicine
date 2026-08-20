@@ -24,14 +24,14 @@ app.add_middleware(
 
 
 @app.get("/live-price")
-def live_price(brand: str, pincode: str = ""):
+def live_price(brand: str):
     """
     Called when the user expands a medicine card on the frontend.
     Returns {"1mg": {...} | null, "pharmeasy": ..., "apollo": ..., "netmeds": ...}
     Any platform that fails (blocked, changed layout, timeout) comes back null —
     the frontend falls back to a plain deep-link for that one.
     """
-    return search_all_sources(brand, pincode)
+    return search_all_sources(brand)
 
 
 @app.get("/health")
@@ -53,7 +53,7 @@ def diagnose(brand: str = "Dolo 650"):
 
     targets = {
         "apollo": ("https://search.apollo247.com/v4/search",
-                   {"query": brand, "pincode": "380001"},
+                   {"query": brand},
                    {"Referer": "https://www.apollopharmacy.in/"}),
         "netmeds": ("https://www.netmeds.com/ext/search/application/api/v1.0/products",
                     {"q": brand}, {}),
@@ -83,5 +83,5 @@ def diagnose(brand: str = "Dolo 650"):
         }
 
     # Also report what the real scrapers produce end to end.
-    out["live_result"] = s.search_all_sources(brand, "380001")
+    out["live_result"] = s.search_all_sources(brand)
     return out

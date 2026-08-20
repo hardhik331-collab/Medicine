@@ -241,10 +241,13 @@ def _tokenize(s):
     letter->digit boundary as a word break (so "650Mg" tokenizes as
     "650", "mg" — matching how a human reads it — instead of staying
     fused as one "650mg" token that a plain "650" query would miss).
+
+    Returns an ORDERED list, not a set — order matters for prefix
+    matching in _best_match (see there for why).
     """
     s = re.sub(r"(\d)([a-zA-Z])", r"\1 \2", s)
     s = re.sub(r"([a-zA-Z])(\d)", r"\1 \2", s)
-    return set(re.findall(r"[a-z0-9]+", s.lower()))
+    return re.findall(r"[a-z0-9]+", s.lower())
 
 
 def _best_match(candidates, brand_name, name_fn):
@@ -255,14 +258,18 @@ def _best_match(candidates, brand_name, name_fn):
     500" instead) — pharmacy search APIs frequently do this to push
     substitutes/cheaper alternatives.
 
-    Uses WHOLE-WORD token matching, not substring matching — "Dolopar"
-    must never match a search for "Dolo", even though "dolo" is a
-    literal substring of "dolopar". Every query token must appear as
-    its own exact word in the candidate name.
+    Uses an ORDERED-PREFIX match, not a subset match. This is stricter
+    than it sounds necessary for, but it has to be: a subset check lets
+    "Roseday A 10mg Capsule" match a search for "Roseday 10", because
+    every query word (roseday, 10) does appear somewhere in that name —
+    but "Roseday A" is a genuinely different combination drug (it
+    includes Aspirin), not the same medicine. A prefix match requires
+    the candidate's name to literally start with "Roseday 10...", so
+    the inserted "A" correctly breaks the match.
 
-    Returns the first candidate whose name contains every word of the
-    query brand name, or None if nothing matches exactly. None means
-    "don't show a price for this platform" rather than "show a
+    Returns the first candidate whose name STARTS WITH the query brand
+    name's words in order, or None if nothing matches exactly. None
+    means "don't show a price for this platform" rather than "show a
     different brand's price" — the frontend already handles None by
     falling back to a plain deep-link, so nothing breaks.
     """
@@ -271,21 +278,23 @@ def _best_match(candidates, brand_name, name_fn):
         return None
     for c in candidates:
         name_tokens = _tokenize(name_fn(c))
-        if query_tokens.issubset(name_tokens):
+        if name_tokens[:len(query_tokens)] == query_tokens:
             return c
     return None
 
 
-def search_apollo(brand_name: str, pincode: str = ""):
+def search_apollo(brand_name: str):
     """
     VERIFIED via live DevTools capture (Aug 2026).
     Endpoint: GET https://search.apollo247.com/v4/search
-    Plain GET, no auth required. pincode is optional but improves accuracy
-    (affects stock/delivery, not price, in most cases).
+    Currently always returns 401 Unauthorized regardless of what we send —
+    Apollo's API requires a credential we don't have. Kept in the platform
+    list because the (correct) product URL still resolves via the deep
+    link fallback; only the live price is unavailable.
     """
     resp = _safe_get(
         "https://search.apollo247.com/v4/search",
-        params={"query": brand_name, "pincode": pincode},
+        params={"query": brand_name},
         headers={
             "Referer": "https://www.apollopharmacy.in/",
             "Origin": "https://www.apollopharmacy.in",
@@ -410,22 +419,23 @@ def search_tata1mg(brand_name: str):
         return {"price": None, "mrp": None, "in_stock": True, "url": pdp_url}
 
 
-def search_pharmeasy(brand_name: str, pincode: str = ""):
+def search_pharmeasy(brand_name: str):
     """
     VERIFIED via live DevTools capture (Aug 2026).
     Two-step process (search/all page is server-rendered Next.js, price
     lives in the embedded __NEXT_DATA__ JSON blob, not a separate API call):
-      1. Fetch https://pharmeasy.in/search/all?name=<brand>&pincode=<pincode>
-         (plain GET). PharmEasy genuinely runs pincode-based dynamic
-         pricing — confirmed via live testing the same medicine priced
-         differently across pincodes (e.g. ~30% swing), unlike Netmeds/1mg
-         which showed flat national pricing regardless of pincode.
+      1. Fetch https://pharmeasy.in/search/all?name=<brand> (plain GET).
+         Note: PharmEasy genuinely runs pincode-based dynamic pricing
+         (confirmed via live testing — same medicine priced ~30%
+         differently across pincodes). Pincode support was removed by
+         request; this now always returns PharmEasy's default/unset-
+         location price rather than a location-specific one.
       2. Extract the __NEXT_DATA__ <script> tag and read
          props.pageProps.productList[0] for mrpDecimal/salePriceDecimal/slug.
     """
     resp = _safe_get(
         "https://pharmeasy.in/search/all",
-        params={"name": brand_name, "pincode": pincode} if pincode else {"name": brand_name},
+        params={"name": brand_name},
     )
     if not resp:
         return None
@@ -485,7 +495,7 @@ PLATFORMS = {
 }
 
 
-def search_all_sources(brand_name: str, pincode: str = ""):
+def search_all_sources(brand_name: str):
     """
     Runs every scraper CONCURRENTLY; each fails independently and returns
     None on failure.
@@ -497,19 +507,14 @@ def search_all_sources(brand_name: str, pincode: str = ""):
 
     Results are cached briefly so a repeat search is instant.
     """
-    cache_key = f"{brand_name.strip().lower()}|{pincode.strip()}"
+    cache_key = brand_name.strip().lower()
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
-    # Only Apollo and PharmEasy have confirmed pincode-dependent pricing —
-    # Netmeds and 1mg showed flat national pricing in live testing, so
-    # there's no point passing pincode to them.
-    pincode_aware = {"apollo", "pharmeasy"}
-
     def run(key, fn):
         try:
-            return key, (fn(brand_name, pincode) if key in pincode_aware else fn(brand_name))
+            return key, fn(brand_name)
         except Exception:
             # One platform blowing up must never take down the others.
             return key, None
