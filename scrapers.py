@@ -9,8 +9,12 @@ STATUS (Aug 2026):
 
 All four platforms are now live-verified. No placeholders remain below.
 """
+import concurrent.futures
 import json
+import os
 import re
+import threading
+import time
 import requests
 
 HEADERS = {
@@ -19,6 +23,157 @@ HEADERS = {
     "Accept": "application/json, text/html",
 }
 TIMEOUT = 8
+
+# ---------------------------------------------------------------------------
+# In-memory result cache
+# ---------------------------------------------------------------------------
+# Medicine prices don't move minute-to-minute, and on a free Render instance
+# every avoided outbound request is real latency saved. A repeated search
+# within the TTL returns instantly instead of re-hitting four pharmacy sites.
+# Bounded so a long-running instance can't grow unboundedly.
+_CACHE_TTL = 900          # 15 minutes
+_CACHE_MAX = 500
+_cache = {}
+_cache_lock = threading.Lock()
+
+
+def _cache_get(key):
+    with _cache_lock:
+        hit = _cache.get(key)
+        if not hit:
+            return None
+        value, expires_at = hit
+        if time.time() > expires_at:
+            _cache.pop(key, None)
+            return None
+        return value
+
+
+def _cache_set(key, value):
+    with _cache_lock:
+        if len(_cache) >= _CACHE_MAX:
+            # Drop the soonest-to-expire entry to make room.
+            oldest = min(_cache, key=lambda k: _cache[k][1])
+            _cache.pop(oldest, None)
+        _cache[key] = (value, time.time() + _CACHE_TTL)
+
+
+# ---------------------------------------------------------------------------
+# LLM fallback (Groq free tier)
+# ---------------------------------------------------------------------------
+# WHAT THIS DOES AND DOESN'T FIX
+#
+# This is a self-healing layer for LAYOUT DRIFT only — when a site renames a
+# JSON key or changes a CSS class, the structured parser above breaks but the
+# page content is still there, and a model can read the price off it.
+#
+# It canNOT fix:
+#   - Apollo: the request is blocked at the network level from cloud IPs, so
+#     there is no page content to read.
+#   - 1mg's missing price: the page is served, but the price block appears to
+#     be withheld from datacenter IPs. A model cannot read text that was
+#     never sent.
+#
+# Cost/latency discipline: this only ever fires when the structured parse
+# already failed, so the happy path never pays for it.
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+# Free-tier model catalogs churn and models get removed without notice, so
+# try in order rather than hardcoding a single name.
+GROQ_MODELS = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "gpt-oss-20b"]
+LLM_TIMEOUT = 6
+
+
+def _price_context(text, max_chars=3000):
+    """
+    Send the model only the parts of the page likely to contain a price,
+    not 600KB of HTML. Grabs windows around rupee symbols / price words.
+    """
+    text = re.sub(r"<script[^>]*>.*?</script>", " ", text, flags=re.DOTALL | re.I)
+    text = re.sub(r"<style[^>]*>.*?</style>", " ", text, flags=re.DOTALL | re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text)
+
+    windows, seen = [], 0
+    for m in re.finditer(r"(?:\u20b9|Rs\.?|MRP|price)", text, re.I):
+        start = max(0, m.start() - 120)
+        windows.append(text[start:m.start() + 180])
+        seen += 1
+        if seen >= 12:
+            break
+    joined = " ... ".join(windows) if windows else text[:max_chars]
+    return joined[:max_chars]
+
+
+def _llm_extract_price(page_text, brand_name, platform):
+    """
+    Ask a small fast model to read price/MRP off page text when the
+    structured parser failed. Returns {"price": float|None, "mrp": float|None}
+    or None. Never raises — a failed fallback just means no price shown.
+    """
+    if not GROQ_API_KEY or not page_text:
+        return None
+
+    context = _price_context(page_text)
+    if not context.strip():
+        return None
+
+    prompt = (
+        f'From this text off a {platform} product page for "{brand_name}", '
+        "extract the current selling price and the MRP (list price) in INR.\n"
+        "Rules:\n"
+        "- Reply with ONLY a JSON object, no prose, no markdown fences.\n"
+        '- Shape: {"price": <number or null>, "mrp": <number or null>}\n'
+        "- price = what the customer pays now; mrp = the struck-through list price.\n"
+        "- If only one number is present, use it as price and set mrp null.\n"
+        "- If you cannot find a real price, return {\"price\": null, \"mrp\": null}. "
+        "Never guess or invent a number.\n\n"
+        f"TEXT:\n{context}"
+    )
+
+    for model in GROQ_MODELS:
+        try:
+            resp = requests.post(
+                GROQ_URL,
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0,
+                    "max_tokens": 80,
+                    "response_format": {"type": "json_object"},
+                },
+                timeout=LLM_TIMEOUT,
+            )
+            if resp.status_code == 404:
+                continue          # model retired — try the next one
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"]
+            content = re.sub(r"```(?:json)?|```", "", content).strip()
+            data = json.loads(content)
+
+            def _num(v):
+                if v is None:
+                    return None
+                try:
+                    f = float(v)
+                except (TypeError, ValueError):
+                    return None
+                # Sanity band: an Indian retail medicine price outside this
+                # range is far more likely a hallucination or a stray number
+                # (pincode, pack count, phone digits) than a real price.
+                return f if 0.5 <= f <= 100000 else None
+
+            price, mrp = _num(data.get("price")), _num(data.get("mrp"))
+            if price is None and mrp is None:
+                return None
+            return {"price": price, "mrp": mrp}
+        except Exception:
+            continue
+    return None
 
 
 def _safe_get(url, headers=None, **kw):
@@ -188,17 +343,20 @@ def search_tata1mg(brand_name: str):
         html = pdp_resp.text
         price_match = re.search(r'displaySmallExtraBold"><span>\u20b9([\d.]+)</span>', html)
         mrp_match = re.search(r'textStrikethrough textTertiary">\u20b9([\d.]+)', html)
-        if not price_match:
-            # Fallback: less brittle pattern in case class names shifted
-            price_match = re.search(r'"mrp"\s*:\s*([\d.]+).*?"discountedPrice"\s*:\s*([\d.]+)', html, re.DOTALL)
-            if price_match:
-                return {"price": float(price_match.group(2)), "mrp": float(price_match.group(1)), "in_stock": True, "url": pdp_url}
-        return {
-            "price": float(price_match.group(1)) if price_match else None,
-            "mrp": float(mrp_match.group(1)) if mrp_match else None,
-            "in_stock": True,
-            "url": pdp_url,
-        }
+        if price_match:
+            return {
+                "price": float(price_match.group(1)),
+                "mrp": float(mrp_match.group(1)) if mrp_match else None,
+                "in_stock": True,
+                "url": pdp_url,
+            }
+        # Structured parse failed — either 1mg changed their markup, or this
+        # page simply didn't include a price block. Hand the raw page to the
+        # LLM fallback; it returns None if there's genuinely no price there.
+        llm = _llm_extract_price(html, brand_name, "Tata 1mg")
+        if llm:
+            return {**llm, "in_stock": True, "url": pdp_url, "via": "llm"}
+        return {"price": None, "mrp": None, "in_stock": True, "url": pdp_url}
     except Exception:
         return {"price": None, "mrp": None, "in_stock": True, "url": pdp_url}
 
@@ -240,11 +398,31 @@ def search_pharmeasy(brand_name: str, pincode: str = ""):
         if not item:
             return None
         slug = item.get("slug")
+        url = f"https://pharmeasy.in/online-medicine-order/{slug}" if slug else None
+        price = float(item["salePriceDecimal"]) if item.get("salePriceDecimal") else None
+        mrp = float(item["mrpDecimal"]) if item.get("mrpDecimal") else None
+
+        # If the price *fields* were renamed but we still matched the right
+        # product, fall back to the LLM — but only on that product's own
+        # page, never the multi-brand search page. Reading a price off a
+        # list of many brands risks attributing another brand's price to
+        # this one, which is worse than showing no price at all.
+        if price is None and url:
+            pdp = _safe_get(url)
+            if pdp:
+                llm = _llm_extract_price(pdp.text, brand_name, "PharmEasy")
+                if llm:
+                    return {
+                        **llm,
+                        "in_stock": item.get("productAvailabilityFlags", {}).get("isAvailable", True),
+                        "url": url,
+                        "via": "llm",
+                    }
         return {
-            "price": float(item["salePriceDecimal"]) if item.get("salePriceDecimal") else None,
-            "mrp": float(item["mrpDecimal"]) if item.get("mrpDecimal") else None,
+            "price": price,
+            "mrp": mrp,
             "in_stock": item.get("productAvailabilityFlags", {}).get("isAvailable", True),
-            "url": f"https://pharmeasy.in/online-medicine-order/{slug}" if slug else None,
+            "url": url,
         }
     except Exception:
         return None
@@ -259,12 +437,48 @@ PLATFORMS = {
 
 
 def search_all_sources(brand_name: str, pincode: str = ""):
-    """Runs every scraper; each one fails independently and returns None on failure."""
+    """
+    Runs every scraper CONCURRENTLY; each fails independently and returns
+    None on failure.
+
+    Concurrency matters a lot here: run sequentially, four scrapers at an
+    8s timeout each (and 1mg makes two round-trips of its own) can stack
+    into ~40s worst case. In parallel the whole call is bounded by the
+    slowest single platform instead of their sum.
+
+    Results are cached briefly so a repeat search is instant.
+    """
+    cache_key = f"{brand_name.strip().lower()}|{pincode.strip()}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     # Only Apollo and PharmEasy have confirmed pincode-dependent pricing —
     # Netmeds and 1mg showed flat national pricing in live testing, so
     # there's no point passing pincode to them.
     pincode_aware = {"apollo", "pharmeasy"}
+
+    def run(key, fn):
+        try:
+            return key, (fn(brand_name, pincode) if key in pincode_aware else fn(brand_name))
+        except Exception:
+            # One platform blowing up must never take down the others.
+            return key, None
+
     out = {}
-    for key, fn in PLATFORMS.items():
-        out[key] = fn(brand_name, pincode) if key in pincode_aware else fn(brand_name)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(PLATFORMS)) as pool:
+        futures = [pool.submit(run, key, fn) for key, fn in PLATFORMS.items()]
+        for fut in concurrent.futures.as_completed(futures, timeout=30):
+            try:
+                key, value = fut.result()
+                out[key] = value
+            except Exception:
+                continue
+
+    # Guarantee every platform key is present even if a worker vanished,
+    # so the frontend never sees an unexpectedly missing field.
+    for key in PLATFORMS:
+        out.setdefault(key, None)
+
+    _cache_set(cache_key, out)
     return out
