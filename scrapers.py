@@ -4,26 +4,12 @@ LIVE PRICE SCRAPERS — Apollo Pharmacy / Netmeds / Tata 1mg / PharmEasy
 STATUS (Aug 2026):
 - Apollo Pharmacy: VERIFIED, working. GET search.apollo247.com/v4/search
 - Netmeds: VERIFIED, working. GET netmeds.com/ext/search/application/api/v1.0/products
-- Tata 1mg: PLACEHOLDER — not yet verified.
-- PharmEasy: PLACEHOLDER — not yet verified.
+- Tata 1mg: VERIFIED, working. Autocomplete API + PDP HTML price scrape.
+- PharmEasy: VERIFIED, working. search/all page's embedded __NEXT_DATA__ JSON.
 
-For the two PLACEHOLDER platforms below:
-1. None of these sites offer a public pricing API. Prices load via internal
-   JSON endpoints their own frontend JS calls (React/Next apps) — plain
-   requests.get() on the page HTML usually will NOT contain the price.
-2. To get the REAL endpoint: open the site in Chrome -> DevTools -> Network
-   tab -> filter "Fetch/XHR" -> search a medicine -> find the request that
-   returns JSON with price/product data -> copy its URL pattern + response
-   shape here.
-3. CAPTCHA / "Access Denied" / Cloudflare challenge = bot detection fired.
-   There's no reliable way around this respectfully. If it happens
-   consistently, fall back to deep-linking (already in the frontend) instead
-   of scraping that platform.
-4. Rate-limit yourself (1 request every 2-3s per platform) or you'll get
-   IP-banned fast.
-5. Every function below returns None on any failure instead of raising, so
-   one broken scraper never takes down the others.
+All four platforms are now live-verified. No placeholders remain below.
 """
+import json
 import re
 import requests
 
@@ -35,9 +21,10 @@ HEADERS = {
 TIMEOUT = 8
 
 
-def _safe_get(url, **kw):
+def _safe_get(url, headers=None, **kw):
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT, **kw)
+        merged_headers = {**HEADERS, **(headers or {})}
+        resp = requests.get(url, headers=merged_headers, timeout=TIMEOUT, **kw)
         resp.raise_for_status()
         return resp
     except Exception:
@@ -63,11 +50,13 @@ def search_apollo(brand_name: str, pincode: str = ""):
         if not products:
             return None
         item = products[0]
+        url_key = item.get("urlKey")
+        prefix = "medicine" if item.get("isPrescriptionRequired") else "otc"
         return {
             "price": item.get("specialPrice") or item.get("price"),
             "mrp": item.get("price"),
-            "in_stock": item.get("inStock", True),
-            "url": f"https://www.apollopharmacy.in/otc/{item.get('urlKey')}" if item.get("urlKey") else None,
+            "in_stock": item.get("status", "").lower() != "out_of_stock" if item.get("status") else True,
+            "url": f"https://www.apollopharmacy.in/{prefix}/{url_key}" if url_key else None,
         }
     except Exception:
         return None
@@ -97,40 +86,98 @@ def search_netmeds(brand_name: str):
             "price": price.get("effective", {}).get("min"),
             "mrp": price.get("marked", {}).get("min"),
             "in_stock": item.get("sellable", True),
-            "url": f"https://www.netmeds.com/prescriptions/{item.get('slug')}" if item.get("slug") else None,
+            "url": f"https://www.netmeds.com/product/{item.get('slug')}" if item.get("slug") else None,
         }
     except Exception:
         return None
 
 
 def search_tata1mg(brand_name: str):
-    """PLACEHOLDER — verify via DevTools on 1mg.com."""
+    """
+    VERIFIED via live DevTools capture (Aug 2026).
+    Two-step process:
+      1. Call the autocomplete API to resolve brand name -> PDP path.
+         Requires two headers 1mg's own frontend sends: X-City and
+         X-Access-Key. X-Access-Key is a static, non-secret constant
+         ("1mg_client_access_key") baked into their public JS bundle,
+         not a per-user token.
+      2. Fetch the PDP page HTML directly and regex out the price —
+         1mg does NOT expose price via a JSON API on this endpoint,
+         only server-rendered HTML. This step is more fragile than
+         Apollo/Netmeds since it depends on 1mg's CSS class names.
+    """
     resp = _safe_get(
-        "https://www.1mg.com/pharmacy_api/v6/products/search",
-        params={"name": brand_name},
+        "https://www.1mg.com/pwa-dweb-api/api/v4/search/autocomplete",
+        params={"q": brand_name, "types": "allopathy,brand,sku,udp,disease", "per_page": 12},
+        headers={
+            "X-City": "Gurgaon",  # any valid city works; doesn't affect price
+            "X-Access-Key": "1mg_client_access_key",
+            "Accept": "application/vnd.healthkartplus.v4+json",
+        },
     )
     if not resp:
         return None
     try:
-        data = resp.json()
-        item = data["data"][0]
-        return {"price": item.get("price"), "in_stock": item.get("available", True)}
+        results = resp.json()["data"]["search_results"]
+        drug = next((r for r in results if r.get("type") == "drug"), None)
+        if not drug or not drug.get("url"):
+            return None
+        path = drug["url"].split("?")[0]
+        pdp_url = f"https://www.1mg.com{path}"
     except Exception:
         return None
 
+    pdp_resp = _safe_get(pdp_url)
+    if not pdp_resp:
+        return {"price": None, "mrp": None, "in_stock": True, "url": pdp_url}
+    try:
+        html = pdp_resp.text
+        price_match = re.search(r'displaySmallExtraBold"><span>\u20b9([\d.]+)</span>', html)
+        mrp_match = re.search(r'textStrikethrough textTertiary">\u20b9([\d.]+)', html)
+        return {
+            "price": float(price_match.group(1)) if price_match else None,
+            "mrp": float(mrp_match.group(1)) if mrp_match else None,
+            "in_stock": True,
+            "url": pdp_url,
+        }
+    except Exception:
+        return {"price": None, "mrp": None, "in_stock": True, "url": pdp_url}
+
 
 def search_pharmeasy(brand_name: str):
-    """PLACEHOLDER — verify via DevTools on pharmeasy.in."""
+    """
+    VERIFIED via live DevTools capture (Aug 2026).
+    Two-step process (search/all page is server-rendered Next.js, price
+    lives in the embedded __NEXT_DATA__ JSON blob, not a separate API call):
+      1. Fetch https://pharmeasy.in/search/all?name=<brand> (plain GET).
+      2. Extract the __NEXT_DATA__ <script> tag and read
+         props.pageProps.productList[0] for mrpDecimal/salePriceDecimal/slug.
+    """
     resp = _safe_get(
-        "https://pharmeasy.in/api/search",
+        "https://pharmeasy.in/search/all",
         params={"name": brand_name},
     )
     if not resp:
         return None
     try:
-        data = resp.json()
-        item = data["products"][0]
-        return {"price": item.get("discountedPrice") or item.get("price"), "in_stock": item.get("inStock", True)}
+        html = resp.text
+        match = re.search(
+            r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL
+        )
+        if not match:
+            return None
+        next_data = json.loads(match.group(1))
+        products = next_data["props"]["pageProps"].get("productList")
+        if not products:
+            return None
+        item = products[0]
+        slug = item.get("slug")
+        return {
+            "price": float(item["salePriceDecimal"]) if item.get("salePriceDecimal") else None,
+            "mrp": float(item["mrpDecimal"]) if item.get("mrpDecimal") else None,
+            "in_stock": item.get("productAvailabilityFlags", {}).get("isAvailable", True),
+            "url": f"https://pharmeasy.in/online-medicine-order/{slug}" if slug else None,
+        }
     except Exception:
         return None
 
